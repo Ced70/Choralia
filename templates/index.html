@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Choralia — Séparation &amp; Transposition Audio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body>
+    <header>
+        <div class="header-content">
+            <div class="header-left">
+                <h1>
+                    <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                    Choralia
+                </h1>
+                <p class="subtitle">Séparez les voix et instruments, transposez la tonalité</p>
+            </div>
+            <button id="theme-toggle" class="theme-toggle" title="Changer le thème" aria-label="Basculer le thème sombre">
+                <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+                <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <main>
+        <!-- Upload Section -->
+        <section id="upload-section" class="card fade-in">
+            <div class="card-header">
+                <span class="step-badge">1</span>
+                <h2>Charger un fichier audio</h2>
+            </div>
+            <div id="drop-zone" class="drop-zone">
+                <svg class="drop-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                <p class="drop-text">Glissez-déposez un fichier ici</p>
+                <p class="small">ou</p>
+                <label class="btn btn-primary" for="file-input">
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+                    Parcourir
+                </label>
+                <input type="file" id="file-input" accept="audio/mpeg,audio/mp4,audio/wav,audio/x-wav,audio/flac,audio/ogg,audio/aac,audio/x-m4a,audio/opus,.mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.webm" hidden>
+                <p class="small formats">MP3, WAV, FLAC, OGG, M4A, AAC et autres — Max 50 Mo</p>
+            </div>
+            <div id="upload-progress" class="progress-bar" hidden>
+                <div class="progress-fill"></div>
+                <span class="progress-text">Envoi en cours...</span>
+            </div>
+
+            <div class="separator-line"><span>ou importer depuis YouTube</span></div>
+
+            <div class="youtube-import">
+                <div class="youtube-input-row">
+                    <div class="input-wrapper">
+                        <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." />
+                        <button id="btn-clear-youtube" class="btn-clear" title="Effacer" hidden>&times;</button>
+                    </div>
+                    <button id="btn-youtube" class="btn btn-primary">Importer</button>
+                </div>
+                <div id="youtube-progress" class="progress-bar" hidden>
+                    <div class="progress-fill indeterminate"></div>
+                    <span class="progress-text">Téléchargement...</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- File loaded indicator -->
+        <section id="file-info" class="card fade-in" hidden>
+            <div class="file-info-bar">
+                <div class="file-info-left">
+                    <svg class="file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                    <span id="loaded-filename"></span>
+                </div>
+                <button id="btn-remove-file" class="btn btn-small btn-ghost" title="Supprimer le fichier">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                    Supprimer
+                </button>
+            </div>
+        </section>
+
+        <!-- Separation Section -->
+        <section id="separation-section" class="card fade-in" hidden>
+            <div class="card-header">
+                <span class="step-badge">2</span>
+                <h2>Séparation voix / instruments</h2>
+            </div>
+            <div class="model-selector">
+                <label for="model-select">Modèle de séparation</label>
+                <select id="model-select">
+                    <option value="htdemucs">4 pistes — Voix, Batterie, Basse, Autres</option>
+                    <option value="htdemucs_ft">4 pistes (qualité max) — plus lent</option>
+                    <option value="htdemucs_6s" selected>6 pistes — Voix, Batterie, Basse, Guitare, Piano, Autres</option>
+                    <option value="hdemucs_mmi">4 pistes (hybride) — Voix, Batterie, Basse, Autres</option>
+                    <option value="mdx_extra">4 pistes (MDX) — bon sur les voix</option>
+                </select>
+            </div>
+            <button id="btn-separate" class="btn btn-primary btn-block">
+                <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.5" cy="17.5" r="2.5"/><circle cx="17.5" cy="15.5" r="2.5"/><path d="M8 17V5l12-2v12"/></svg>
+                Séparer les pistes
+            </button>
+            <div id="separation-progress" class="progress-bar" hidden>
+                <div class="progress-fill"></div>
+                <span class="progress-text">Démarrage...</span>
+            </div>
+            <div id="tracks-container" hidden>
+                <h3>Pistes séparées</h3>
+                <div id="tracks-list"></div>
+                <div id="mix-section">
+                    <button id="btn-mix" class="btn btn-secondary btn-block" disabled>
+                        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6L21 6"/><path d="M8 12L21 12"/><path d="M8 18L21 18"/><circle cx="4" cy="6" r="1.5"/><circle cx="4" cy="12" r="1.5"/><circle cx="4" cy="18" r="1.5"/></svg>
+                        Assembler les pistes sélectionnées
+                    </button>
+                    <div id="mix-progress" class="progress-bar" hidden>
+                        <div class="progress-fill indeterminate"></div>
+                        <span class="progress-text">Assemblage en cours...</span>
+                    </div>
+                    <div id="mix-result" hidden>
+                        <h3>Mix assemblé</h3>
+                        <div id="mix-result-content"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Transposition Section -->
+        <section id="transposition-section" class="card fade-in" hidden>
+            <div class="card-header">
+                <span class="step-badge">3</span>
+                <h2>Transposition</h2>
+            </div>
+            <p class="section-desc">Modifiez la tonalité du fichier original, d'une piste séparée ou d'un mix.</p>
+
+            <div class="transpose-controls">
+                <div class="form-group">
+                    <label for="transpose-source">Fichier à transposer</label>
+                    <select id="transpose-source">
+                        <option value="original">Fichier original</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label for="transpose-semitones">Transposition</label>
+                    <div class="semitone-control">
+                        <input type="range" id="transpose-semitones" min="-12" max="12" value="0" step="1">
+                        <div class="semitone-info">
+                            <span id="semitone-display" class="semitone-display">0</span>
+                            <span class="semitone-unit">demi-tons</span>
+                        </div>
+                    </div>
+                    <p id="semitone-label" class="semitone-label">Pas de transposition</p>
+                </div>
+
+                <button id="btn-transpose" class="btn btn-primary btn-block" disabled>
+                    <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+                    Transposer
+                </button>
+            </div>
+
+            <div id="transpose-progress" class="progress-bar" hidden>
+                <div class="progress-fill indeterminate"></div>
+                <span class="progress-text">Transposition en cours...</span>
+            </div>
+
+            <div id="transpose-result" hidden>
+                <h3>Résultat</h3>
+                <div id="transpose-result-content"></div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>Choralia — Outil audio pour la chorale — par Cédric GILLOT</p>
+    </footer>
+
+    <script src="/static/script.js?v=4"></script>
+</body>
+</html>
