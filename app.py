@@ -1,9 +1,11 @@
 import os
 import uuid
 import shutil
+import subprocess
 import threading
 import time
 import logging
+import tempfile
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, render_template
@@ -11,8 +13,16 @@ from flask import Flask, request, jsonify, send_file, render_template
 import librosa
 import soundfile as sf
 import numpy as np
+from static_ffmpeg import run as _static_ffmpeg_run
+import nodejs_wheel as _nodejs_wheel
 
 app = Flask(__name__)
+
+FFMPEG_BIN, FFPROBE_BIN = _static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
+FFMPEG_DIR = str(Path(FFMPEG_BIN).parent)
+NODE_BIN = str(Path(_nodejs_wheel.executable.ROOT_DIR) / "bin" / "node")
+# Make ffmpeg/ffprobe/node discoverable by child libraries (yt-dlp, etc.)
+os.environ["PATH"] = FFMPEG_DIR + os.pathsep + str(Path(NODE_BIN).parent) + os.pathsep + os.environ.get("PATH", "")
 
 # --- Logging ---
 logging.basicConfig(
@@ -69,6 +79,36 @@ _demucs_models: dict[str, object] = {}
 _demucs_last_used: float = 0
 _MODEL_IDLE_TIMEOUT = 600  # 10 minutes
 
+_FILE_RETENTION_SECONDS = 60 * 60  # 1 hour: files in uploads/ and outputs/ untouched for this long are removed
+_CLEANUP_INTERVAL_SECONDS = 60     # how often the background loop checks
+
+
+def write_mp3(path: Path, audio: np.ndarray, sr: int, bitrate: str = "192k") -> None:
+    """Write a numpy audio array as MP3 via ffmpeg.
+
+    audio shape: (samples,) for mono or (samples, channels) for stereo
+    (i.e. the same layout soundfile.write expects).
+    """
+    # Write a temporary WAV next to the target, then transcode with ffmpeg.
+    # Going through a temp WAV is simpler/safer than piping raw PCM and keeps
+    # this code agnostic to bit depth and channel layouts.
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(path.parent)) as tmp:
+        tmp_path = tmp.name
+    try:
+        sf.write(tmp_path, audio, samplerate=sr)
+        cmd = [
+            FFMPEG_BIN, "-y", "-loglevel", "error",
+            "-i", tmp_path,
+            "-codec:a", "libmp3lame", "-b:a", bitrate,
+            str(path),
+        ]
+        subprocess.run(cmd, check=True)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
 
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -86,33 +126,62 @@ def resolve_extension(file) -> str | None:
     return MIME_TO_EXT.get(mime)
 
 
-def cleanup_old_files(max_age_hours: int = 2):
-    """Remove files older than max_age_hours from uploads and outputs."""
+def cleanup_old_files(max_age_seconds: int = _FILE_RETENTION_SECONDS):
+    """Remove files/folders in uploads and outputs whose mtime is older than max_age_seconds.
+
+    For directories (e.g. outputs/<file_id>/ from a separation), we look at the most
+    recent mtime among the directory itself and its contents — so a folder that contains
+    a recently-created stem isn't deleted prematurely.
+    """
     now = time.time()
     removed = 0
     for directory in (UPLOAD_DIR, OUTPUT_DIR):
+        if not directory.exists():
+            continue
         for item in directory.iterdir():
-            if item.is_file() and (now - item.stat().st_mtime) > max_age_hours * 3600:
-                log.info("Nettoyage : suppression de %s", item.name)
-                item.unlink(missing_ok=True)
-                removed += 1
-            elif item.is_dir() and (now - item.stat().st_mtime) > max_age_hours * 3600:
-                log.info("Nettoyage : suppression du dossier %s", item.name)
-                shutil.rmtree(item, ignore_errors=True)
-                removed += 1
+            try:
+                if item.is_file():
+                    age = now - item.stat().st_mtime
+                    if age > max_age_seconds:
+                        log.info("Nettoyage : suppression de %s (âge %.0fs)", item.name, age)
+                        item.unlink(missing_ok=True)
+                        removed += 1
+                elif item.is_dir():
+                    # Use the most recently modified item inside the dir as the freshness signal
+                    latest = item.stat().st_mtime
+                    for child in item.rglob("*"):
+                        try:
+                            latest = max(latest, child.stat().st_mtime)
+                        except OSError:
+                            pass
+                    age = now - latest
+                    if age > max_age_seconds:
+                        log.info("Nettoyage : suppression du dossier %s (âge %.0fs)", item.name, age)
+                        shutil.rmtree(item, ignore_errors=True)
+                        removed += 1
+            except OSError as e:
+                log.warning("Nettoyage : impossible de traiter %s : %s", item, e)
     if removed:
         log.info("Nettoyage terminé : %d élément(s) supprimé(s)", removed)
 
 
-# --- Automatic model unloading after inactivity ---
+# --- Automatic cleanup loops ---
 
-def _cleanup_models_loop():
-    """Background thread that unloads models after _MODEL_IDLE_TIMEOUT seconds of inactivity."""
+def _cleanup_loop():
+    """Background thread:
+       1) deletes uploads/outputs files untouched for _FILE_RETENTION_SECONDS
+       2) unloads Demucs models after _MODEL_IDLE_TIMEOUT seconds of inactivity
+    """
     global _demucs_last_used
 
     while True:
-        time.sleep(60)
+        time.sleep(_CLEANUP_INTERVAL_SECONDS)
         now = time.time()
+
+        try:
+            cleanup_old_files()
+        except Exception as e:
+            log.error("Nettoyage périodique : erreur %s", e, exc_info=True)
 
         with _gpu_lock:
             if _demucs_models and _demucs_last_used and (now - _demucs_last_used) > _MODEL_IDLE_TIMEOUT:
@@ -125,7 +194,7 @@ def _cleanup_models_loop():
                     log.info("Cache GPU vidé")
 
 
-_cleanup_thread = threading.Thread(target=_cleanup_models_loop, daemon=True)
+_cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
 _cleanup_thread.start()
 
 
@@ -133,7 +202,6 @@ _cleanup_thread.start()
 
 @app.route("/")
 def index():
-    cleanup_old_files()
     return render_template("index.html")
 
 
@@ -167,19 +235,95 @@ def upload():
     })
 
 
+_YT_URL_RE = r'^https?://(www\.|m\.)?(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/watch\?v=)[\w-]+'
+_YT_VIDEO_ID_RE = r'^[\w-]{11}$'
+
+
+@app.route("/search_youtube", methods=["POST"])
+def search_youtube():
+    import re
+    data = request.get_json()
+    if not data or "query" not in data:
+        return jsonify({"error": "Paramètre 'query' manquant"}), 400
+
+    query = data["query"].strip()
+    if not query:
+        return jsonify({"error": "Requête vide"}), 400
+    if len(query) > 200:
+        return jsonify({"error": "Requête trop longue"}), 400
+
+    try:
+        limit = int(data.get("limit", 10))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(20, limit))
+
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "noplaylist": True,
+            "default_search": f"ytsearch{limit}",
+            "js_runtimes": {"node": {"path": NODE_BIN}},
+            "remote_components": ["ejs:github"],
+        }
+        t0 = time.time()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+
+        entries = info.get("entries", []) if info else []
+        results = []
+        for e in entries:
+            if not e:
+                continue
+            vid = e.get("id")
+            if not vid:
+                continue
+            # Pick the best available thumbnail (highest resolution)
+            thumb = None
+            thumbs = e.get("thumbnails") or []
+            if thumbs:
+                thumb = thumbs[-1].get("url")
+            if not thumb:
+                thumb = f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+            results.append({
+                "video_id": vid,
+                "title": e.get("title") or "(sans titre)",
+                "channel": e.get("channel") or e.get("uploader") or "",
+                "duration": e.get("duration"),  # seconds, may be None
+                "thumbnail": thumb,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+            })
+
+        log.info("Recherche YouTube « %s » : %d résultats en %.1fs", query, len(results), time.time() - t0)
+        return jsonify({"results": results})
+
+    except Exception as e:
+        log.error("Recherche YouTube échouée (« %s ») : %s", query, e)
+        return jsonify({"error": f"Erreur lors de la recherche : {e}"}), 500
+
+
 @app.route("/import_youtube", methods=["POST"])
 def import_youtube():
     import re
     data = request.get_json()
-    if not data or "url" not in data:
-        return jsonify({"error": "Paramètre 'url' manquant"}), 400
+    if not data:
+        return jsonify({"error": "Données manquantes"}), 400
 
-    url = data["url"].strip()
+    url = (data.get("url") or "").strip()
+    video_id = (data.get("video_id") or "").strip()
 
-    # Validate YouTube URL
-    youtube_pattern = r'^https?://(www\.|m\.)?(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/watch\?v=)[\w-]+'
-    if not re.match(youtube_pattern, url):
-        return jsonify({"error": "URL YouTube invalide"}), 400
+    if video_id:
+        if not re.match(_YT_VIDEO_ID_RE, video_id):
+            return jsonify({"error": "video_id invalide"}), 400
+        url = f"https://www.youtube.com/watch?v={video_id}"
+    elif url:
+        if not re.match(_YT_URL_RE, url):
+            return jsonify({"error": "URL YouTube invalide"}), 400
+    else:
+        return jsonify({"error": "Paramètre 'url' ou 'video_id' manquant"}), 400
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "running", "progress": "Démarrage du téléchargement..."}
@@ -210,6 +354,9 @@ def _run_youtube_import(job_id: str, url: str):
             }],
             "noplaylist": True,
             "quiet": True,
+            "ffmpeg_location": FFMPEG_DIR,
+            "js_runtimes": {"node": {"path": NODE_BIN}},
+            "remote_components": ["ejs:github"],
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -348,9 +495,9 @@ def _run_separation(job_id: str, filepath: Path, stored_as: str, model_name: str
         for i, stem_name in enumerate(model.sources):
             stem_audio = sources[i].cpu().numpy()
             # stem_audio shape: (channels, samples)
-            out_path = output_subdir / f"{stem_name}.wav"
-            sf.write(str(out_path), stem_audio.T, samplerate=sr)
-            tracks[stem_name] = f"{file_id}/{stem_name}.wav"
+            out_path = output_subdir / f"{stem_name}.mp3"
+            write_mp3(out_path, stem_audio.T, sr)
+            tracks[stem_name] = f"{file_id}/{stem_name}.mp3"
 
         # Create instrumental mix (everything except vocals)
         instrumental_parts = []
@@ -360,9 +507,9 @@ def _run_separation(job_id: str, filepath: Path, stored_as: str, model_name: str
 
         if instrumental_parts:
             instrumental = sum(instrumental_parts)
-            out_path = output_subdir / "instrumental.wav"
-            sf.write(str(out_path), instrumental.T, samplerate=sr)
-            tracks["instrumental"] = f"{file_id}/instrumental.wav"
+            out_path = output_subdir / "instrumental.mp3"
+            write_mp3(out_path, instrumental.T, sr)
+            tracks["instrumental"] = f"{file_id}/instrumental.mp3"
 
         elapsed = time.time() - t_start
         log.info("[job=%s] Séparation terminée : %d pistes en %.1fs (%s)", job_id[:8], len(tracks), elapsed, ", ".join(tracks.keys()))
@@ -429,7 +576,7 @@ def transpose():
 
         sign = "plus" if semitones > 0 else "minus"
         source_stem = Path(source).stem
-        out_name = f"{source_stem}_transposed_{sign}{abs(semitones)}.wav"
+        out_name = f"{source_stem}_transposed_{sign}{abs(semitones)}.mp3"
 
         # Put transposed file next to the source if it's in a subdir, otherwise in outputs/
         if "/" in source:
@@ -440,7 +587,11 @@ def transpose():
         out_dir.mkdir(exist_ok=True)
 
         out_path = out_dir / out_name
-        sf.write(str(out_path), y_shifted, samplerate=sr)
+        # write_mp3 expects (samples,) or (samples, channels)
+        if y_shifted.ndim > 1:
+            write_mp3(out_path, y_shifted.T, sr)
+        else:
+            write_mp3(out_path, y_shifted, sr)
 
         log.info("Transposition OK : %s en %.1fs", out_name, time.time() - t0)
 
@@ -501,13 +652,13 @@ def mix():
         short_id = str(uuid.uuid4())[:8]
         out_dir = OUTPUT_DIR / file_id
         out_dir.mkdir(exist_ok=True)
-        out_name = f"mix_{short_id}.wav"
+        out_name = f"mix_{short_id}.mp3"
         out_path = out_dir / out_name
 
         if mix_signal.ndim > 1:
-            sf.write(str(out_path), mix_signal.T, samplerate=sr_out)
+            write_mp3(out_path, mix_signal.T, sr_out)
         else:
-            sf.write(str(out_path), mix_signal, samplerate=sr_out)
+            write_mp3(out_path, mix_signal, sr_out)
 
         elapsed = time.time() - t0
         size_mb = out_path.stat().st_size / (1024 * 1024)
@@ -552,13 +703,13 @@ if __name__ == "__main__":
     import atexit
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--public", action="store_true", help="Disable debug for public access")
-    parser.add_argument("--tunnel", action="store_true", help="Launch Cloudflare tunnel automatically")
+    parser.add_argument("--no-tunnel", action="store_true", help="Disable the Cloudflare tunnel (local-only mode)")
     args = parser.parse_args()
+    tunnel_enabled = not args.no_tunnel
 
     tunnel_proc = None
 
-    if args.tunnel:
+    if tunnel_enabled:
         cloudflared_bin = BASE_DIR / "cloudflared"
         if cloudflared_bin.exists():
             print(" * Lancement du tunnel Cloudflare...")
@@ -602,5 +753,7 @@ if __name__ == "__main__":
         else:
             print(" * ATTENTION : cloudflared introuvable, tunnel non démarré")
 
-    log.info("Démarrage de Choralia (debug=%s, tunnel=%s)", not args.public and not args.tunnel, args.tunnel)
-    app.run(debug=not args.public and not args.tunnel, host="0.0.0.0", port=5000)
+    from waitress import serve
+
+    log.info("Démarrage de Choralia (production, tunnel=%s)", tunnel_enabled)
+    serve(app, host="0.0.0.0", port=5000, threads=8)

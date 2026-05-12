@@ -51,9 +51,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const mixProgress = document.getElementById("mix-progress");
     const mixResult = document.getElementById("mix-result");
     const mixResultContent = document.getElementById("mix-result-content");
-    const youtubeUrl = document.getElementById("youtube-url");
+    const youtubeQuery = document.getElementById("youtube-query");
     const btnYoutube = document.getElementById("btn-youtube");
     const btnClearYoutube = document.getElementById("btn-clear-youtube");
+    const youtubeSearchProgress = document.getElementById("youtube-search-progress");
+    const youtubeResults = document.getElementById("youtube-results");
     const youtubeProgress = document.getElementById("youtube-progress");
 
     // --- Drag & Drop ---
@@ -178,56 +180,153 @@ document.addEventListener("DOMContentLoaded", () => {
         fileInput.value = "";
     });
 
-    // --- YouTube Import ---
-    youtubeUrl.addEventListener("input", () => {
-        btnClearYoutube.hidden = !youtubeUrl.value;
+    // --- YouTube Search & Import ---
+    const YT_URL_PATTERN = /^https?:\/\/(www\.|m\.)?(youtube\.com\/watch\?v=|youtu\.be\/|music\.youtube\.com\/watch\?v=)[\w-]+/;
+
+    youtubeQuery.addEventListener("input", () => {
+        btnClearYoutube.hidden = !youtubeQuery.value;
     });
 
     btnClearYoutube.addEventListener("click", () => {
-        youtubeUrl.value = "";
+        youtubeQuery.value = "";
         btnClearYoutube.hidden = true;
-        youtubeUrl.focus();
+        youtubeResults.hidden = true;
+        youtubeResults.innerHTML = "";
+        youtubeQuery.focus();
     });
 
-    btnYoutube.addEventListener("click", async () => {
-        const url = youtubeUrl.value.trim();
-        if (!url) return;
+    youtubeQuery.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+            e.preventDefault();
+            btnYoutube.click();
+        }
+    });
 
-        const ytPattern = /^https?:\/\/(www\.|m\.)?(youtube\.com\/watch\?v=|youtu\.be\/|music\.youtube\.com\/watch\?v=)[\w-]+/;
-        if (!ytPattern.test(url)) {
-            showError(youtubeProgress, "URL YouTube invalide.");
-            youtubeProgress.hidden = false;
+    function formatDuration(seconds) {
+        if (!seconds || !isFinite(seconds)) return "—";
+        const s = Math.round(seconds);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        const sec = s % 60;
+        if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+        return `${m}:${String(sec).padStart(2, "0")}`;
+    }
+
+    function escapeHtml(s) {
+        return String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    btnYoutube.addEventListener("click", async () => {
+        const input = youtubeQuery.value.trim();
+        if (!input) return;
+
+        // If the user pasted a YouTube URL, download directly — skip the search step.
+        if (YT_URL_PATTERN.test(input)) {
+            startYoutubeDownload({ url: input });
             return;
         }
 
+        // Otherwise, search.
+        youtubeResults.hidden = true;
+        youtubeResults.innerHTML = "";
         btnYoutube.disabled = true;
+        youtubeSearchProgress.hidden = false;
+        const searchFill = youtubeSearchProgress.querySelector(".progress-fill");
+        const searchText = youtubeSearchProgress.querySelector(".progress-text");
+        searchFill.classList.add("indeterminate");
+        searchFill.style.background = "";
+        searchText.textContent = "Recherche sur YouTube...";
+
+        try {
+            const response = await fetch("/search_youtube", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ query: input, limit: 10 }),
+            });
+            const data = await response.json();
+
+            if (!response.ok) {
+                showError(youtubeSearchProgress, data.error || "Erreur de recherche.");
+                btnYoutube.disabled = false;
+                return;
+            }
+
+            youtubeSearchProgress.hidden = true;
+            btnYoutube.disabled = false;
+            displaySearchResults(data.results || []);
+        } catch (err) {
+            showError(youtubeSearchProgress, "Erreur de connexion au serveur.");
+            btnYoutube.disabled = false;
+        }
+    });
+
+    function displaySearchResults(results) {
+        youtubeResults.innerHTML = "";
+        if (results.length === 0) {
+            youtubeResults.innerHTML = '<p class="search-empty">Aucun résultat.</p>';
+            youtubeResults.hidden = false;
+            return;
+        }
+
+        for (const r of results) {
+            const item = document.createElement("button");
+            item.type = "button";
+            item.className = "search-result-item";
+            item.dataset.videoId = r.video_id;
+            item.innerHTML = `
+                <div class="search-thumb">
+                    <img src="${escapeHtml(r.thumbnail)}" alt="" loading="lazy">
+                    <span class="search-duration">${formatDuration(r.duration)}</span>
+                </div>
+                <div class="search-meta">
+                    <div class="search-title">${escapeHtml(r.title)}</div>
+                    <div class="search-channel">${escapeHtml(r.channel || "")}</div>
+                </div>
+            `;
+            item.addEventListener("click", () => {
+                startYoutubeDownload({ video_id: r.video_id, title: r.title });
+            });
+            youtubeResults.appendChild(item);
+        }
+        youtubeResults.hidden = false;
+    }
+
+    function startYoutubeDownload(payload) {
+        youtubeResults.hidden = true;
         youtubeProgress.hidden = false;
         const progressFill = youtubeProgress.querySelector(".progress-fill");
         const progressText = youtubeProgress.querySelector(".progress-text");
         progressFill.classList.add("indeterminate");
         progressFill.style.background = "";
-        progressText.textContent = "Téléchargement depuis YouTube...";
+        progressText.textContent = payload.title
+            ? `Téléchargement : ${payload.title}...`
+            : "Téléchargement depuis YouTube...";
+        btnYoutube.disabled = true;
 
-        try {
-            const response = await fetch("/import_youtube", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url }),
-            });
-            const data = await response.json();
-
-            if (!response.ok) {
-                showError(youtubeProgress, data.error || "Erreur.");
+        fetch("/import_youtube", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        })
+            .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+            .then(({ ok, data }) => {
+                if (!ok) {
+                    showError(youtubeProgress, data.error || "Erreur.");
+                    btnYoutube.disabled = false;
+                    return;
+                }
+                pollYoutubeJob(data.job_id, progressText, progressFill);
+            })
+            .catch(() => {
+                showError(youtubeProgress, "Erreur de connexion au serveur.");
                 btnYoutube.disabled = false;
-                return;
-            }
-
-            pollYoutubeJob(data.job_id, progressText, progressFill);
-        } catch (err) {
-            showError(youtubeProgress, "Erreur de connexion au serveur.");
-            btnYoutube.disabled = false;
-        }
-    });
+            });
+    }
 
     async function pollYoutubeJob(jobId, progressText, progressFill) {
         try {

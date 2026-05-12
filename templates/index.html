@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=3">
+    <link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
     <header>
@@ -49,17 +49,22 @@
                 <span class="progress-text">Envoi en cours...</span>
             </div>
 
-            <div class="separator-line"><span>ou importer depuis YouTube</span></div>
+            <div class="separator-line"><span>ou rechercher sur YouTube</span></div>
 
             <div class="youtube-import">
                 <div class="youtube-input-row">
                     <div class="input-wrapper">
-                        <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                        <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." />
+                        <svg class="input-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                        <input type="text" id="youtube-query" placeholder="Titre, artiste… ou collez une URL YouTube" />
                         <button id="btn-clear-youtube" class="btn-clear" title="Effacer" hidden>&times;</button>
                     </div>
-                    <button id="btn-youtube" class="btn btn-primary">Importer</button>
+                    <button id="btn-youtube" class="btn btn-primary">Rechercher</button>
                 </div>
+                <div id="youtube-search-progress" class="progress-bar" hidden>
+                    <div class="progress-fill indeterminate"></div>
+                    <span class="progress-text">Recherche...</span>
+                </div>
+                <div id="youtube-results" class="search-results" hidden></div>
                 <div id="youtube-progress" class="progress-bar" hidden>
                     <div class="progress-fill indeterminate"></div>
                     <span class="progress-text">Téléchargement...</span>
@@ -175,6 +180,6 @@
         <p>Choralia — Outil audio pour la chorale — par Cédric GILLOT</p>
     </footer>
 
-    <script src="/static/script.js?v=4"></script>
+    <script src="/static/script.js?v=5"></script>
 </body>
 </html>
