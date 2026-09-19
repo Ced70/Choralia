@@ -12,3 +12,12 @@ dependencies = [
     "waitress>=3.0.2",
     "yt-dlp>=2026.3.17",
 ]
+
+[tool.uv]
+# Le projet ne tourne que sur Linux (DGX Spark, ARM64) : évite que des contraintes
+# propres à macOS x86_64 (numpy<2, torch<2.3 via demucs) ne rétrogradent les paquets.
+environments = ["sys_platform == 'linux'"]
+# sphn (décodage audio de demucs.api) n'a pas de roue ARM64 et ne compile pas sans
+# libopus-dev. Choralia charge l'audio avec librosa et n'utilise jamais demucs.api,
+# donc on retire cette dépendance de la résolution.
+override-dependencies = ["sphn ; sys_platform == 'never'"]

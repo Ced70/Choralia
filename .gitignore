@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.idea/
+uploads/
+outputs/
+cloudflared.old*

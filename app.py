@@ -5,7 +5,7 @@ import subprocess
 import threading
 import time
 import logging
-import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask, request, jsonify, send_file, render_template
@@ -31,6 +31,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("choralia")
+# huggingface-hub (poids Demucs) journalise chaque requête HTTP en INFO via httpx : trop bavard
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -38,7 +40,8 @@ OUTPUT_DIR = BASE_DIR / "outputs"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 Mo
+# 95 Mo : reste sous le plafond de 100 Mo par requête imposé par le tunnel Cloudflare (offre gratuite)
+MAX_CONTENT_LENGTH = 95 * 1024 * 1024  # 95 Mo
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
 ALLOWED_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "webm", "3gp", "weba"}
@@ -82,32 +85,55 @@ _MODEL_IDLE_TIMEOUT = 600  # 10 minutes
 _FILE_RETENTION_SECONDS = 60 * 60  # 1 hour: files in uploads/ and outputs/ untouched for this long are removed
 _CLEANUP_INTERVAL_SECONDS = 60     # how often the background loop checks
 
+# Pinned host buffer used as a relay for GPU -> CPU copies of the separated stems.
+# On the DGX Spark (GB10, unified memory) a plain tensor.cpu() into freshly
+# allocated pageable memory runs at ~100 MB/s (3.5 s for 3 minutes of audio),
+# while copies into pinned memory run at tens of GB/s. Streaming through a small
+# pinned buffer keeps the copy fast for any file length without pinning much RAM.
+_STAGING_BYTES = 64 * 1024 * 1024
+_staging: "torch.Tensor | None" = None
+_staging_lock = threading.Lock()
+
+
+def _gpu_to_numpy(t) -> np.ndarray:
+    """Copy a float32 CUDA tensor to a numpy array through the pinned relay buffer."""
+    import torch
+
+    global _staging
+    if not t.is_cuda:
+        return t.numpy()
+    flat = t.contiguous().view(-1)
+    out = np.empty(flat.numel(), dtype=np.float32)
+    with _staging_lock:
+        if _staging is None:
+            _staging = torch.empty(_STAGING_BYTES // 4, dtype=torch.float32, pin_memory=True)
+        staging_np = _staging.numpy()
+        n = _staging.numel()
+        for i in range(0, flat.numel(), n):
+            k = min(n, flat.numel() - i)
+            _staging[:k].copy_(flat[i:i + k])
+            out[i:i + k] = staging_np[:k]
+    return out.reshape(tuple(t.shape))
+
 
 def write_mp3(path: Path, audio: np.ndarray, sr: int, bitrate: str = "192k") -> None:
     """Write a numpy audio array as MP3 via ffmpeg.
 
     audio shape: (samples,) for mono or (samples, channels) for stereo
     (i.e. the same layout soundfile.write expects).
+
+    The samples are piped to ffmpeg as raw float32 PCM: no temporary WAV on
+    disk, and no 16-bit quantisation before the MP3 encoder.
     """
-    # Write a temporary WAV next to the target, then transcode with ffmpeg.
-    # Going through a temp WAV is simpler/safer than piping raw PCM and keeps
-    # this code agnostic to bit depth and channel layouts.
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=str(path.parent)) as tmp:
-        tmp_path = tmp.name
-    try:
-        sf.write(tmp_path, audio, samplerate=sr)
-        cmd = [
-            FFMPEG_BIN, "-y", "-loglevel", "error",
-            "-i", tmp_path,
-            "-codec:a", "libmp3lame", "-b:a", bitrate,
-            str(path),
-        ]
-        subprocess.run(cmd, check=True)
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    pcm = np.ascontiguousarray(audio, dtype=np.float32)
+    channels = 1 if pcm.ndim == 1 else pcm.shape[1]
+    cmd = [
+        FFMPEG_BIN, "-y", "-loglevel", "error",
+        "-f", "f32le", "-ar", str(sr), "-ac", str(channels), "-i", "pipe:0",
+        "-codec:a", "libmp3lame", "-b:a", bitrate,
+        str(path),
+    ]
+    subprocess.run(cmd, input=pcm.tobytes(), check=True)
 
 
 def allowed_file(filename: str) -> bool:
@@ -354,6 +380,7 @@ def _run_youtube_import(job_id: str, url: str):
             }],
             "noplaylist": True,
             "quiet": True,
+            "noprogress": True,  # pas de barre de progression yt-dlp dans les journaux
             "ffmpeg_location": FFMPEG_DIR,
             "js_runtimes": {"node": {"path": NODE_BIN}},
             "remote_components": ["ejs:github"],
@@ -484,32 +511,38 @@ def _run_separation(job_id: str, filepath: Path, stored_as: str, model_name: str
             with torch.no_grad():
                 sources = apply_model(model, wav, device=device)
             # sources shape: (batch, num_sources, channels, samples)
-            sources = sources[0]  # remove batch dim
+            sources_np = _gpu_to_numpy(sources[0])  # remove batch dim, copy to CPU
+            del sources, wav
             log.info("[job=%s] Inférence terminée en %.1fs", job_id[:8], time.time() - t_infer)
 
         file_id = stored_as.rsplit(".", 1)[0]
         output_subdir = OUTPUT_DIR / file_id
         output_subdir.mkdir(exist_ok=True)
 
-        tracks = {}
-        for i, stem_name in enumerate(model.sources):
-            stem_audio = sources[i].cpu().numpy()
-            # stem_audio shape: (channels, samples)
-            out_path = output_subdir / f"{stem_name}.mp3"
-            write_mp3(out_path, stem_audio.T, sr)
-            tracks[stem_name] = f"{file_id}/{stem_name}.mp3"
+        jobs[job_id]["progress"] = "Encodage des pistes..."
+        t_enc = time.time()
 
-        # Create instrumental mix (everything except vocals)
-        instrumental_parts = []
-        for i, stem_name in enumerate(model.sources):
-            if stem_name != "vocals":
-                instrumental_parts.append(sources[i].cpu().numpy())
+        # Stems to encode: each model source, plus an instrumental mix
+        # (everything except vocals). sources_np[i] shape: (channels, samples)
+        to_encode: list[tuple[str, np.ndarray]] = [
+            (stem_name, sources_np[i]) for i, stem_name in enumerate(model.sources)
+        ]
+        non_vocal_idx = [i for i, n in enumerate(model.sources) if n != "vocals"]
+        if non_vocal_idx:
+            to_encode.append(("instrumental", sources_np[non_vocal_idx].sum(axis=0)))
 
-        if instrumental_parts:
-            instrumental = sum(instrumental_parts)
-            out_path = output_subdir / "instrumental.mp3"
-            write_mp3(out_path, instrumental.T, sr)
-            tracks["instrumental"] = f"{file_id}/instrumental.mp3"
+        # ffmpeg/libmp3lame is single-threaded: encode all stems in parallel
+        # processes instead of one after the other (this was the bulk of the
+        # separation time, far more than the model inference itself).
+        def _encode(item: tuple[str, np.ndarray]) -> tuple[str, str]:
+            stem_name, stem_audio = item
+            write_mp3(output_subdir / f"{stem_name}.mp3", stem_audio.T, sr)
+            return stem_name, f"{file_id}/{stem_name}.mp3"
+
+        workers = min(len(to_encode), os.cpu_count() or 1)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            tracks = dict(pool.map(_encode, to_encode))
+        log.info("[job=%s] %d pistes encodées en %.1fs", job_id[:8], len(tracks), time.time() - t_enc)
 
         elapsed = time.time() - t_start
         log.info("[job=%s] Séparation terminée : %d pistes en %.1fs (%s)", job_id[:8], len(tracks), elapsed, ", ".join(tracks.keys()))
@@ -567,11 +600,25 @@ def transpose():
         except ValueError:
             return jsonify({"error": "Chemin de fichier invalide"}), 400
 
-    log.info("Transposition : source=%s, demi-tons=%+d", source, semitones)
+    # Run in the background and let the client poll /job_status: on long files the
+    # pitch shift can exceed the 100 s response timeout of the Cloudflare tunnel.
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "running", "progress": "Démarrage de la transposition..."}
 
+    log.info("Transposition démarrée : source=%s, demi-tons=%+d (job=%s)", source, semitones, job_id)
+    thread = threading.Thread(target=_run_transposition, args=(job_id, source, source_path, semitones))
+    thread.start()
+
+    return jsonify({"job_id": job_id})
+
+
+def _run_transposition(job_id: str, source: str, source_path: Path, semitones: int):
+    t0 = time.time()
     try:
-        t0 = time.time()
+        jobs[job_id]["progress"] = "Chargement du fichier audio..."
         y, sr = librosa.load(str(source_path), sr=None)
+
+        jobs[job_id]["progress"] = "Transposition en cours (cela peut prendre quelques minutes)..."
         y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
 
         sign = "plus" if semitones > 0 else "minus"
@@ -586,6 +633,7 @@ def transpose():
             out_dir = OUTPUT_DIR
         out_dir.mkdir(exist_ok=True)
 
+        jobs[job_id]["progress"] = "Encodage MP3..."
         out_path = out_dir / out_name
         # write_mp3 expects (samples,) or (samples, channels)
         if y_shifted.ndim > 1:
@@ -593,14 +641,14 @@ def transpose():
         else:
             write_mp3(out_path, y_shifted, sr)
 
-        log.info("Transposition OK : %s en %.1fs", out_name, time.time() - t0)
+        log.info("[job=%s] Transposition OK : %s en %.1fs", job_id[:8], out_name, time.time() - t0)
 
         relative = str(out_path.relative_to(OUTPUT_DIR))
-        return jsonify({"transposed_file": relative, "filename": out_name})
+        jobs[job_id] = {"status": "done", "transposed_file": relative, "filename": out_name}
 
     except Exception as e:
-        log.error("Transposition échouée (source=%s) : %s", source, e, exc_info=True)
-        return jsonify({"error": f"Erreur lors de la transposition : {e}"}), 500
+        log.error("[job=%s] Transposition échouée après %.1fs (source=%s) : %s", job_id[:8], time.time() - t0, source, e, exc_info=True)
+        jobs[job_id] = {"status": "error", "error": f"Erreur lors de la transposition : {e}"}
 
 
 @app.route("/mix", methods=["POST"])

@@ -90,9 +90,9 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // --- Upload ---
     function uploadFile(file) {
-        const maxSize = 50 * 1024 * 1024;
+        const maxSize = 95 * 1024 * 1024;
         if (file.size > maxSize) {
-            showError(uploadProgressBar, "Le fichier dépasse la limite de 50 Mo.");
+            showError(uploadProgressBar, "Le fichier dépasse la limite de 95 Mo.");
             return;
         }
 
@@ -614,6 +614,12 @@ document.addEventListener("DOMContentLoaded", () => {
         btnTranspose.disabled = true;
         transposeProgress.hidden = false;
         transposeResult.hidden = true;
+        const progressFill = transposeProgress.querySelector(".progress-fill");
+        const progressText = transposeProgress.querySelector(".progress-text");
+        progressFill.classList.add("indeterminate");
+        progressFill.style.width = "";
+        progressFill.style.background = "";
+        progressText.textContent = "Transposition en cours...";
 
         try {
             const response = await fetch("/transpose", {
@@ -623,33 +629,52 @@ document.addEventListener("DOMContentLoaded", () => {
             });
             const data = await response.json();
 
-            transposeProgress.hidden = true;
-
             if (!response.ok) {
-                showError(transposeResultContent, data.error || "Erreur.");
-                transposeResult.hidden = false;
+                showError(transposeProgress, data.error || "Erreur.");
                 btnTranspose.disabled = false;
                 return;
             }
 
-            transposeResult.hidden = false;
-            transposeResultContent.innerHTML = `
-                <div class="track-item">
-                    <span class="track-name">${data.filename}</span>
-                    <audio controls preload="none" src="/download/${data.transposed_file}"></audio>
-                    <div class="track-actions">
-                        <a href="/download/${data.transposed_file}" class="btn btn-small btn-success" download>Télécharger</a>
-                    </div>
-                </div>
-            `;
-            btnTranspose.disabled = false;
+            pollTransposeJob(data.job_id, progressText, progressFill);
         } catch (err) {
-            transposeProgress.hidden = true;
-            showError(transposeResultContent, "Erreur de connexion au serveur.");
-            transposeResult.hidden = false;
+            showError(transposeProgress, "Erreur de connexion au serveur.");
             btnTranspose.disabled = false;
         }
     });
+
+    async function pollTransposeJob(jobId, progressText, progressFill) {
+        try {
+            const response = await fetch(`/job_status/${jobId}`);
+            const data = await response.json();
+
+            if (data.status === "running") {
+                progressText.textContent = data.progress || "Transposition en cours...";
+                setTimeout(() => pollTransposeJob(jobId, progressText, progressFill), 2000);
+            } else if (data.status === "done") {
+                progressFill.classList.remove("indeterminate");
+                progressFill.style.width = "100%";
+                progressText.textContent = "Terminé !";
+                transposeResult.hidden = false;
+                transposeResultContent.innerHTML = `
+                    <div class="track-item">
+                        <span class="track-name">${data.filename}</span>
+                        <audio controls preload="none" src="/download/${data.transposed_file}"></audio>
+                        <div class="track-actions">
+                            <a href="/download/${data.transposed_file}" class="btn btn-small btn-success" download>Télécharger</a>
+                        </div>
+                    </div>
+                `;
+                btnTranspose.disabled = false;
+                setTimeout(() => { transposeProgress.hidden = true; }, 1500);
+            } else if (data.status === "error") {
+                showError(transposeProgress, data.error || "Erreur lors de la transposition.");
+                btnTranspose.disabled = false;
+            }
+        } catch (err) {
+            showError(transposeProgress, "Erreur de connexion.");
+            btnTranspose.disabled = false;
+        }
+    }
 
     // --- Helpers ---
     function showError(container, message) {
