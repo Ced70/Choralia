@@ -210,6 +210,48 @@ def write_mp3(path: Path, audio: np.ndarray, sr: int, bitrate: str = "192k") -> 
     subprocess.run(cmd, input=pcm.tobytes(), check=True)
 
 
+def probe_audio(path: Path) -> tuple[int, int]:
+    """Fréquence d'échantillonnage et nombre de canaux du premier flux audio (via ffprobe)."""
+    cmd = [FFPROBE_BIN, "-v", "error", "-select_streams", "a:0",
+           "-show_entries", "stream=sample_rate,channels", "-of", "csv=p=0", str(path)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        sr_str, ch_str = proc.stdout.strip().splitlines()[0].split(",")[:2]
+        return int(sr_str), int(ch_str)
+    except (IndexError, ValueError):
+        raise ValueError("Fichier audio illisible ou corrompu (aucun flux audio reconnu).") from None
+
+
+def load_audio(path: Path, sr: int | None = None, mono: bool = False) -> tuple[np.ndarray, int]:
+    """Décode un fichier audio en float32 avec ffmpeg, même mise en forme que librosa.load.
+
+    librosa s'appuie sur libsndfile, qui ne lit ni AAC/M4A, ni Opus/WebM, ni 3GP, ni les
+    « .mp3 » produits par certains convertisseurs (en réalité de l'AAC) : ces fichiers,
+    pourtant acceptés à l'envoi, échouaient avec « File does not exist or is not a
+    regular file ». ffmpeg (statique, déjà utilisé pour l'encodage) lit tout cela.
+
+    Retourne (y, sr) avec y de forme (samples,) si mono, sinon (canaux, samples) avec
+    au plus 2 canaux ; sr=None conserve la fréquence d'origine.
+    """
+    src_sr, src_ch = probe_audio(path)
+    out_sr = sr or src_sr
+    # On décode toujours en stéréo (si la source l'est) et on moyenne en numpy pour le mono :
+    # le mixage mono de ffmpeg (L+R à -3 dB) sortirait 3 dB plus fort que librosa et pourrait saturer.
+    out_ch = 1 if src_ch < 2 else 2
+    cmd = [FFMPEG_BIN, "-v", "error", "-i", str(path), "-vn",
+           "-f", "f32le", "-acodec", "pcm_f32le", "-ar", str(out_sr), "-ac", str(out_ch), "pipe:1"]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0 or len(proc.stdout) < 4 * out_ch:
+        detail = proc.stderr.decode("utf-8", errors="ignore").strip().splitlines()
+        log.warning("ffmpeg n'a pas pu décoder %s : %s", path.name, detail[-1] if detail else "(pas de détail)")
+        raise ValueError("Fichier audio illisible ou corrompu.")
+    y = np.frombuffer(proc.stdout, dtype=np.float32)
+    if out_ch > 1:
+        y = y[: len(y) - len(y) % out_ch].reshape(-1, out_ch).T
+        y = y.mean(axis=0) if mono else np.ascontiguousarray(y)
+    return y, out_sr
+
+
 def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -670,8 +712,8 @@ def _run_separation(job_id: str, filepath: Path, stored_as: str, model_name: str
         jobs[job_id]["progress"] = "Chargement du fichier audio..."
         log.info("[job=%s] Chargement audio : %s", job_id[:8], filepath.name)
 
-        # Load audio with librosa (mono=False to keep channels)
-        y, sr = librosa.load(str(filepath), sr=model.samplerate, mono=False)
+        # Décodage ffmpeg (mono=False pour garder les canaux)
+        y, sr = load_audio(filepath, sr=model.samplerate, mono=False)
         duration_sec = y.shape[-1] / sr
         log.info("[job=%s] Audio chargé : %.1fs, sr=%d, channels=%s", job_id[:8], duration_sec, sr, y.shape[0] if y.ndim > 1 else 1)
 
@@ -800,7 +842,7 @@ def _run_transposition(job_id: str, source: str, source_path: Path, semitones: i
     t0 = time.time()
     try:
         jobs[job_id]["progress"] = "Chargement du fichier audio..."
-        y, sr = librosa.load(str(source_path), sr=None)
+        y, sr = load_audio(source_path, sr=None, mono=True)
 
         jobs[job_id]["progress"] = "Transposition en cours (cela peut prendre quelques minutes)..."
         y_shifted = librosa.effects.pitch_shift(y, sr=sr, n_steps=semitones)
@@ -872,7 +914,7 @@ def mix():
         signals = []
         sr_out = None
         for p in resolved:
-            y, sr = librosa.load(str(p), sr=None, mono=False)
+            y, sr = load_audio(p, sr=None, mono=False)
             if sr_out is None:
                 sr_out = sr
             signals.append(y)
