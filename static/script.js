@@ -89,7 +89,10 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     // --- Upload ---
-    function uploadFile(file) {
+    // Le fichier est envoyé par morceaux (voir /upload/start côté serveur) : le tunnel
+    // Cloudflare coupe toute requête sans réponse au bout de 100 s, ce qui faisait
+    // échouer les gros fichiers envoyés depuis une connexion lente.
+    async function uploadFile(file) {
         const maxSize = 95 * 1024 * 1024;
         if (file.size > maxSize) {
             showError(uploadProgressBar, "Le fichier dépasse la limite de 95 Mo.");
@@ -106,52 +109,99 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const progressFill = uploadProgressBar.querySelector(".progress-fill");
         const progressText = uploadProgressBar.querySelector(".progress-text");
+        const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
 
         uploadProgressBar.hidden = false;
         progressFill.classList.remove("indeterminate");
         progressFill.style.width = "0%";
         progressFill.style.background = "";
-        progressText.textContent = `${file.name} — 0 %`;
+        progressText.textContent = `${file.name} — 0 % de ${sizeMB} Mo`;
 
-        const formData = new FormData();
-        formData.append("file", file);
+        const updateProgress = (sent) => {
+            const pct = Math.min(100, Math.round((sent / file.size) * 100));
+            progressFill.style.width = pct + "%";
+            progressText.textContent = `${file.name} — ${pct} % de ${sizeMB} Mo`;
+        };
 
-        const xhr = new XMLHttpRequest();
+        try {
+            const start = await postJson("/upload/start", {
+                filename: file.name,
+                size: file.size,
+                mime: file.type || "",
+            });
+            const chunkSize = start.chunk_size;
 
-        xhr.upload.addEventListener("progress", (e) => {
-            if (e.lengthComputable) {
-                const pct = Math.round((e.loaded / e.total) * 100);
-                progressFill.style.width = pct + "%";
-                const sizeMB = (e.total / (1024 * 1024)).toFixed(1);
-                progressText.textContent = `${file.name} — ${pct} % de ${sizeMB} Mo`;
+            for (let offset = 0; offset < file.size; offset += chunkSize) {
+                const chunk = file.slice(offset, Math.min(offset + chunkSize, file.size));
+                await sendChunk(start.upload_id, offset, chunk, (loaded) => updateProgress(offset + loaded));
             }
-        });
 
-        xhr.addEventListener("load", () => {
-            try {
-                const data = JSON.parse(xhr.responseText);
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    progressFill.style.width = "100%";
-                    progressText.textContent = `${file.name} — Chargé !`;
-                    currentFile = data;
-                    setTimeout(() => {
-                        uploadProgressBar.hidden = true;
-                        showFileLoaded();
-                    }, 600);
+            const data = await postJson(`/upload/finish/${start.upload_id}`, {});
+            progressFill.style.width = "100%";
+            progressText.textContent = `${file.name} — Chargé !`;
+            currentFile = data;
+            setTimeout(() => {
+                uploadProgressBar.hidden = true;
+                showFileLoaded();
+            }, 600);
+        } catch (err) {
+            showError(uploadProgressBar, err.message || "Erreur lors de l'envoi.");
+        }
+    }
+
+    // POST JSON → JSON ; lève une erreur portant le message du serveur (ou le code HTTP)
+    async function postJson(url, payload) {
+        let response;
+        try {
+            response = await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        } catch {
+            throw new Error("Erreur de connexion au serveur.");
+        }
+        let data = null;
+        try { data = await response.json(); } catch { /* réponse non JSON (page d'erreur Cloudflare, etc.) */ }
+        if (!response.ok) {
+            throw new Error((data && data.error) || `Erreur lors de l'envoi (réponse HTTP ${response.status} du serveur).`);
+        }
+        return data;
+    }
+
+    // Envoie un morceau avec suivi de progression ; réessaie jusqu'à 3 fois sur erreur réseau ou 5xx
+    function sendChunk(uploadId, offset, chunk, onProgress, attempt = 1) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.upload.addEventListener("progress", (e) => {
+                if (e.lengthComputable) onProgress(e.loaded);
+            });
+            const retryOrFail = (message) => {
+                if (attempt < 3) {
+                    setTimeout(() => sendChunk(uploadId, offset, chunk, onProgress, attempt + 1).then(resolve, reject), 2000 * attempt);
                 } else {
-                    showError(uploadProgressBar, data.error || "Erreur lors de l'envoi.");
+                    reject(new Error(message));
                 }
-            } catch {
-                showError(uploadProgressBar, "Erreur lors de l'envoi.");
-            }
+            };
+            xhr.addEventListener("load", () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    onProgress(chunk.size);
+                    resolve();
+                } else if (xhr.status >= 500) {
+                    retryOrFail(`Erreur lors de l'envoi (réponse HTTP ${xhr.status} du serveur).`);
+                } else {
+                    let message = `Erreur lors de l'envoi (réponse HTTP ${xhr.status} du serveur).`;
+                    try { message = JSON.parse(xhr.responseText).error || message; } catch { /* non JSON */ }
+                    reject(new Error(message));
+                }
+            });
+            xhr.addEventListener("error", () => retryOrFail("Erreur de connexion au serveur."));
+            xhr.addEventListener("timeout", () => retryOrFail("Délai d'envoi dépassé."));
+            xhr.timeout = 90000;
+            xhr.open("POST", `/upload/chunk/${uploadId}?offset=${offset}`);
+            xhr.setRequestHeader("Content-Type", "application/octet-stream");
+            xhr.send(chunk);
         });
-
-        xhr.addEventListener("error", () => {
-            showError(uploadProgressBar, "Erreur de connexion au serveur.");
-        });
-
-        xhr.open("POST", "/upload");
-        xhr.send(formData);
     }
 
     function showFileLoaded() {

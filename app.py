@@ -33,6 +33,14 @@ logging.basicConfig(
 log = logging.getLogger("choralia")
 # huggingface-hub (poids Demucs) journalise chaque requête HTTP en INFO via httpx : trop bavard
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# waitress signale les déconnexions client et la saturation de la file : utile pour diagnostiquer les envois
+logging.getLogger("waitress").setLevel(logging.INFO)
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+_file_handler = logging.FileHandler(LOG_DIR / "choralia.log", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"))
+logging.getLogger().addHandler(_file_handler)
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -43,6 +51,72 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # 95 Mo : reste sous le plafond de 100 Mo par requête imposé par le tunnel Cloudflare (offre gratuite)
 MAX_CONTENT_LENGTH = 95 * 1024 * 1024  # 95 Mo
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+
+
+# --- Journal d'accès (une ligne par requête : IP réelle, taille, statut, durée) ---
+_QUIET_PATHS = ("/job_status/", "/static/", "/favicon.ico")
+
+
+def _client_ip(environ) -> str:
+    return environ.get("HTTP_CF_CONNECTING_IP") or environ.get("REMOTE_ADDR") or "?"
+
+
+class _AccessLog:
+    """Middleware WSGI : journalise le début (arrivée des en-têtes) et la fin de chaque requête.
+
+    Le début est journalisé séparément parce qu'un envoi de fichier volumineux peut
+    durer longtemps ou être interrompu : on veut savoir qu'il a commencé même s'il
+    ne se termine jamais (client parti, coupure du tunnel...).
+    """
+
+    def __init__(self, wsgi):
+        self.wsgi = wsgi
+
+    def __call__(self, environ, start_response):
+        from werkzeug.wsgi import ClosingIterator
+
+        path = environ.get("PATH_INFO", "")
+        method = environ.get("REQUEST_METHOD", "")
+        if path.startswith(_QUIET_PATHS):
+            return self.wsgi(environ, start_response)
+
+        ip = _client_ip(environ)
+        length = environ.get("CONTENT_LENGTH") or "0"
+        ray = environ.get("HTTP_CF_RAY", "-")
+        ua = environ.get("HTTP_USER_AGENT", "-")
+        t0 = time.time()
+        if method == "POST":
+            try:
+                size_mb = int(length) / (1024 * 1024)
+            except ValueError:
+                size_mb = 0.0
+            log.info("→ %s %s ip=%s taille=%.1f Mo ray=%s ua=%s", method, path, ip, size_mb, ray, ua)
+
+        status_holder = {"status": "?"}
+
+        def _start_response(status, headers, exc_info=None):
+            status_holder["status"] = status
+            return start_response(status, headers, exc_info)
+
+        def _done():
+            log.info("← %s %s ip=%s statut=%s durée=%.1fs", method, path, ip, status_holder["status"], time.time() - t0)
+
+        try:
+            result = self.wsgi(environ, _start_response)
+        except Exception:
+            log.exception("✗ %s %s ip=%s : exception après %.1fs", method, path, ip, time.time() - t0)
+            raise
+        return ClosingIterator(result, _done)
+
+
+app.wsgi_app = _AccessLog(app.wsgi_app)
+
+
+@app.errorhandler(413)
+def _request_too_large(e):
+    log.warning("Requête refusée (413) : Content-Length=%s dépasse la limite de %d Mo (ip=%s)",
+                request.content_length, MAX_CONTENT_LENGTH // (1024 * 1024), _client_ip(request.environ))
+    return jsonify({"error": f"Fichier trop volumineux : la limite est de {MAX_CONTENT_LENGTH // (1024 * 1024)} Mo."}), 413
 
 ALLOWED_EXTENSIONS = {"mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "webm", "3gp", "weba"}
 
@@ -140,16 +214,19 @@ def allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def resolve_extension(file) -> str | None:
-    """Determine file extension from filename or MIME type (for mobile uploads)."""
-    filename = file.filename or ""
+def extension_from(filename: str | None, mime: str | None) -> str | None:
+    """Extension à partir du nom de fichier, sinon du type MIME (navigateurs mobiles)."""
+    filename = filename or ""
     if "." in filename:
         ext = filename.rsplit(".", 1)[1].lower()
         if ext in ALLOWED_EXTENSIONS:
             return ext
-    # Fallback: try to determine from MIME type (mobile browsers often send this)
-    mime = file.content_type or ""
-    return MIME_TO_EXT.get(mime)
+    return MIME_TO_EXT.get(mime or "")
+
+
+def resolve_extension(file) -> str | None:
+    """Determine file extension from filename or MIME type (for mobile uploads)."""
+    return extension_from(file.filename, file.content_type)
 
 
 def cleanup_old_files(max_age_seconds: int = _FILE_RETENTION_SECONDS):
@@ -172,6 +249,9 @@ def cleanup_old_files(max_age_seconds: int = _FILE_RETENTION_SECONDS):
                         log.info("Nettoyage : suppression de %s (âge %.0fs)", item.name, age)
                         item.unlink(missing_ok=True)
                         removed += 1
+                        if item.suffix == ".part":
+                            with _uploads_lock:
+                                _uploads.pop(item.stem, None)
                 elif item.is_dir():
                     # Use the most recently modified item inside the dir as the freshness signal
                     latest = item.stat().st_mtime
@@ -259,6 +339,110 @@ def upload():
         "filename": file.filename or f"audio.{ext}",
         "stored_as": safe_name,
     })
+
+
+# --- Envoi par morceaux ---
+# Cloudflare (offre gratuite) répond 524 dès que l'origine n'a pas répondu en 100 s, et
+# waitress ne transmet une requête à Flask qu'une fois son corps entièrement reçu. Un envoi
+# de 87 Mo depuis une connexion lente (> 100 s) échouait donc systématiquement, sans jamais
+# atteindre l'application. Le navigateur découpe désormais le fichier en morceaux de
+# CHUNK_SIZE octets, chacun envoyé dans sa propre requête courte, et le serveur les recolle.
+CHUNK_SIZE = 4 * 1024 * 1024  # 4 Mo : ~35 s à 1 Mbit/s, bien sous les 100 s de Cloudflare
+
+# upload_id -> {path, size, ext, filename, ip, t0, done: set d'offsets reçus, lock}
+_uploads: dict[str, dict] = {}
+_uploads_lock = threading.Lock()
+
+
+@app.route("/upload/start", methods=["POST"])
+def upload_start():
+    data = request.get_json(silent=True) or {}
+    filename = (data.get("filename") or "").strip()
+    mime = (data.get("mime") or "").strip()
+    try:
+        size = int(data.get("size", 0))
+    except (TypeError, ValueError):
+        size = 0
+    ip = _client_ip(request.environ)
+
+    if size <= 0:
+        return jsonify({"error": "Taille de fichier invalide"}), 400
+    if size > MAX_CONTENT_LENGTH:
+        log.warning("Envoi refusé : %s fait %.1f Mo (limite %d Mo, ip=%s)",
+                    filename, size / (1024 * 1024), MAX_CONTENT_LENGTH // (1024 * 1024), ip)
+        return jsonify({"error": f"Fichier trop volumineux : la limite est de {MAX_CONTENT_LENGTH // (1024 * 1024)} Mo."}), 413
+
+    ext = extension_from(filename, mime)
+    if not ext:
+        log.warning("Envoi refusé : format non supporté (filename=%s, mime=%s, ip=%s)", filename, mime, ip)
+        return jsonify({"error": "Format non supporté. Formats acceptés : MP3, WAV, FLAC, OGG, M4A, AAC, OPUS, WEBM"}), 400
+
+    upload_id = str(uuid.uuid4())
+    part_path = UPLOAD_DIR / f"{upload_id}.part"
+    part_path.touch()
+    with _uploads_lock:
+        _uploads[upload_id] = {
+            "path": part_path, "size": size, "ext": ext, "filename": filename or f"audio.{ext}",
+            "ip": ip, "t0": time.time(), "done": set(), "lock": threading.Lock(),
+        }
+    n_chunks = -(-size // CHUNK_SIZE)
+    log.info("Envoi par morceaux démarré : %s (%.1f Mo, %d morceaux) id=%s ip=%s",
+             filename, size / (1024 * 1024), n_chunks, upload_id, ip)
+    return jsonify({"upload_id": upload_id, "chunk_size": CHUNK_SIZE})
+
+
+@app.route("/upload/chunk/<upload_id>", methods=["POST"])
+def upload_chunk(upload_id):
+    with _uploads_lock:
+        up = _uploads.get(upload_id)
+    if not up:
+        log.warning("Morceau reçu pour un envoi inconnu ou expiré : %s", upload_id)
+        return jsonify({"error": "Envoi inconnu ou expiré, recommencez l'envoi du fichier."}), 404
+
+    try:
+        offset = int(request.args.get("offset", "-1"))
+    except ValueError:
+        offset = -1
+    body = request.get_data()
+    if offset < 0 or offset % CHUNK_SIZE != 0 or offset >= up["size"] or not body \
+            or offset + len(body) > up["size"] or (len(body) != CHUNK_SIZE and offset + len(body) != up["size"]):
+        log.warning("Morceau invalide pour %s : offset=%d taille=%d (fichier %d)", upload_id, offset, len(body), up["size"])
+        return jsonify({"error": "Morceau invalide"}), 400
+
+    with up["lock"]:
+        with open(up["path"], "r+b") as f:
+            f.seek(offset)
+            f.write(body)
+        up["done"].add(offset)
+        n_done, n_total = len(up["done"]), -(-up["size"] // CHUNK_SIZE)
+    if n_done == 1 or n_done == n_total or n_done % 5 == 0:
+        log.info("Envoi %s : morceau %d/%d reçu", upload_id, n_done, n_total)
+    return jsonify({"received": n_done, "total": n_total})
+
+
+@app.route("/upload/finish/<upload_id>", methods=["POST"])
+def upload_finish(upload_id):
+    with _uploads_lock:
+        up = _uploads.pop(upload_id, None)
+    if not up:
+        log.warning("Fin d'envoi pour un envoi inconnu ou expiré : %s", upload_id)
+        return jsonify({"error": "Envoi inconnu ou expiré, recommencez l'envoi du fichier."}), 404
+
+    expected = set(range(0, up["size"], CHUNK_SIZE))
+    with up["lock"]:
+        missing = expected - up["done"]
+        actual = up["path"].stat().st_size if up["path"].exists() else -1
+    if missing or actual != up["size"]:
+        log.warning("Envoi %s incomplet : %d morceau(x) manquant(s), %d/%d octets", upload_id, len(missing), actual, up["size"])
+        up["path"].unlink(missing_ok=True)
+        return jsonify({"error": "Envoi incomplet, recommencez l'envoi du fichier."}), 400
+
+    file_id = str(uuid.uuid4())
+    safe_name = f"{file_id}.{up['ext']}"
+    up["path"].rename(UPLOAD_DIR / safe_name)
+    log.info("Upload OK (par morceaux) : %s (%.1f Mo en %.0fs) → %s ip=%s",
+             up["filename"], up["size"] / (1024 * 1024), time.time() - up["t0"], safe_name, up["ip"])
+    return jsonify({"file_id": file_id, "filename": up["filename"], "stored_as": safe_name})
 
 
 _YT_URL_RE = r'^https?://(www\.|m\.)?(youtube\.com/watch\?v=|youtu\.be/|music\.youtube\.com/watch\?v=)[\w-]+'
@@ -779,19 +963,23 @@ if __name__ == "__main__":
             atexit.register(_stop_tunnel)
             signal.signal(signal.SIGTERM, lambda *_: (_stop_tunnel(), exit(0)))
 
+            # Vider stderr en continu vers logs/cloudflared.log : sans lecteur, le tube se
+            # remplit (64 Ko) et cloudflared finit par se bloquer sur ses propres journaux.
+            _tunnel_connected = threading.Event()
+
+            def _drain_tunnel_stderr():
+                with open(LOG_DIR / "cloudflared.log", "ab") as f:
+                    for raw in tunnel_proc.stderr:
+                        f.write(raw)
+                        f.flush()
+                        line = raw.decode("utf-8", errors="ignore")
+                        if "Registered tunnel connection" in line or "Connection registered" in line:
+                            _tunnel_connected.set()
+
+            threading.Thread(target=_drain_tunnel_stderr, daemon=True).start()
+
             # Attendre que le tunnel soit connecté (max 15s)
-            import select
-            deadline = time.time() + 15
-            connected = False
-            while time.time() < deadline:
-                ready, _, _ = select.select([tunnel_proc.stderr], [], [], 0.5)
-                if ready:
-                    line = tunnel_proc.stderr.readline().decode("utf-8", errors="ignore")
-                    if "Registered tunnel connection" in line or "Connection registered" in line:
-                        connected = True
-                        break
-                if tunnel_proc.poll() is not None:
-                    break
+            connected = _tunnel_connected.wait(timeout=15)
 
             if connected:
                 print(" * Tunnel Cloudflare connecté !")
